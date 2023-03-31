@@ -1,13 +1,16 @@
 import re
 import html
 import openai
+import asyncio
 from maubot import Plugin, MessageEvent
 from maubot.handlers import command
+from maubot.handlers import event
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
+from mautrix.types import EventType, StateEvent, Membership
 
 class Config(BaseProxyConfig):
-  def do_update(self, helper: ConfigUpdateHelper) -> None:
-    helper.copy("API_KEY")
+    def do_update(self, helper: ConfigUpdateHelper) -> None:
+        helper.copy("API_KEY")
 
 class AIBot(Plugin):
     @classmethod
@@ -22,33 +25,65 @@ class AIBot(Plugin):
         super().__init__(*args, **kwargs)
         openai.api_key = self.config["API_KEY"]
         self.conversations = {}
+        self.join_message_lock = asyncio.Lock()
+
+    @event.on(EventType.ROOM_MEMBER)
+    async def handle_join(self, evt: StateEvent) -> None:
+        if evt.content.membership != Membership.JOIN:
+            return
+
+        if evt.state_key != self.client.mxid:
+            return
+
+        async with self.join_message_lock:
+            # Check if the join message has been sent using room account data
+            try:
+                join_message_sent_data = await self.client.get_account_data("maubot.join_message_sent", evt.room_id)
+            except:
+                join_message_sent_data = None
+            if join_message_sent_data and join_message_sent_data.get("join_message_sent"):
+                return
+            
+            # Set the room account data to indicate that the join message has been sent
+            await self.client.set_account_data("maubot.join_message_sent", {"join_message_sent": True}, evt.room_id)
+
+
+            room_members = await self.get_joined_members(evt.room_id)
+            num_members = len(room_members)
+
+            if len(room_members) == 2 or (len(room_members) == 3 and any(member.endswith("bot:beeper.local") for member in room_members)):
+                message = f"I am your friendly neighbourhood Beeper AI! <br><br>I am powered by ChatGPT. All messages sent in this chat will be shared with Beeper and OpenAI."
+            else:
+                message = f"I am your friendly neighbourhood Beeper AI! Send me a message starting with <a href='https://matrix.to/#/{self.client.mxid}'>@{self.client.mxid}</a> and I will reply.<br><br>I am powered by ChatGPT. All messages sent in this chat will be shared with Beeper and OpenAI."
+
+            await self.client.send_message_event(
+                evt.room_id,
+                EventType.ROOM_MESSAGE,
+                {
+                    "msgtype": "m.text",
+                    "body": html.unescape(re.sub('<[^<]+?>', '', message)),  # Plain text version of the message
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": message,
+                }
+            )
+
 
     @command.passive(regex=r".*")
     async def process_message(self, event: MessageEvent, _: str) -> None:
         # Check if the room has only 2 members or 3 members with one bot
         room_members = await self.get_joined_members(event.room_id)
-        if len(room_members) == 2 or any(member.endswith("bot:beeper.local") for member in room_members):
+        should_reply = False
+        if len(room_members) == 2 or (len(room_members) == 3 and any(member.endswith("bot:beeper.local") for member in room_members)):
+            should_reply = True
+        elif not any(member.endswith("bot:beeper.local") for member in room_members):
+            mention_data = self.is_bot_mentioned(event)
+            if mention_data:
+                should_reply = True
+
+        if should_reply:
             input_text = event.content["body"][:self.MAX_INPUT_LENGTH]
             response_text = self.chat_gpt_3_5(input_text, event.room_id)
             await event.reply(response_text)
-        else:
-            # Check if the bot is mentioned in the message
-            mention_data = self.is_bot_mentioned(event)
-            if mention_data:
-                start, end, text = mention_data
-                print(text)
-                if "!clear" in text.lower():
-                    self.conversations.pop(event.room_id, None)
-                    await event.reply("Conversation history cleared.")
-                else:
-                    input_text = text[:self.MAX_INPUT_LENGTH]
-                    if len(input_text) == self.MAX_INPUT_LENGTH:
-                        await event.reply(f"Input text exceeds maximum length of {self.MAX_INPUT_LENGTH} characters.")
-                        return
-                    response_text = self.chat_gpt_3_5(input_text, event.room_id)
-                    await event.reply(response_text)
-
-
 
     async def get_joined_members(self, room_id):
         room_members = []
